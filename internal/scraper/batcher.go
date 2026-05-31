@@ -142,7 +142,7 @@ func (b *Batcher) executePending(pending []*pendingCall) {
 	bodyMap := make(map[string]map[string]any, len(pending))
 	for i, p := range pending {
 		methods = append(methods, p.method)
-		bodyMap[strconv.Itoa(i)] = map[string]any{"json": p.input}
+		bodyMap[strconv.Itoa(i)] = p.input
 	}
 
 	reqURL := b.s.baseURL + strings.Join(methods, ",") + "?batch=1"
