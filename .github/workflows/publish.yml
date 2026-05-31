@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 env:
-  REGISTRY: registry.digitalocean.com
+  REGISTRY: registry.digitalocean.com/warerastats-registry
   IMAGE_NAME: gateway
 
 jobs:
