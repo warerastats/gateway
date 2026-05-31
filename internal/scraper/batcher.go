@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	flushInterval    = 500 * time.Millisecond
+	flushInterval    = 100 * time.Millisecond
 	maxBatchSize     = 100
 	earlyFlushThresh = 150
 	rateLimitPerMin  = 200
