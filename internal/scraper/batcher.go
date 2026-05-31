@@ -48,13 +48,15 @@ type Batcher struct {
 	queue []*pendingCall
 	seq   uint64
 
-	tokens *tokenBucket
+	flushCh chan struct{}
+	tokens  *tokenBucket
 }
 
 func NewBatcher(s *Scraper) *Batcher {
 	b := &Batcher{
-		s:      s,
-		tokens: newTokenBucket(rateLimitPerMin, float64(rateLimitPerMin)/60.0),
+		s:       s,
+		flushCh: make(chan struct{}, 1),
+		tokens:  newTokenBucket(rateLimitPerMin, float64(rateLimitPerMin)/60.0),
 	}
 	go b.loop()
 	return b
@@ -74,7 +76,15 @@ func (b *Batcher) Add(method string, input map[string]any, prio int) <-chan Batc
 		seq:      b.seq,
 		resultCh: ch,
 	})
+	full := len(b.queue) >= maxBatchSize
 	b.mu.Unlock()
+
+	if full && b.tokens.hasAtLeast(5) {
+		select {
+		case b.flushCh <- struct{}{}:
+		default:
+		}
+	}
 
 	return ch
 }
@@ -82,8 +92,13 @@ func (b *Batcher) Add(method string, input map[string]any, prio int) <-chan Batc
 func (b *Batcher) loop() {
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		b.flush()
+	for {
+		select {
+		case <-ticker.C:
+			b.flush()
+		case <-b.flushCh:
+			b.flush()
+		}
 	}
 }
 
@@ -218,6 +233,24 @@ func (tb *tokenBucket) tryConsume(n float64) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
+	tb.refillLocked()
+
+	if tb.tokens < n {
+		return false
+	}
+	tb.tokens -= n
+	return true
+}
+
+func (tb *tokenBucket) hasAtLeast(n float64) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	tb.refillLocked()
+	return tb.tokens >= n
+}
+
+func (tb *tokenBucket) refillLocked() {
 	now := time.Now()
 	elapsed := now.Sub(tb.lastCheck).Seconds()
 	tb.lastCheck = now
@@ -225,10 +258,4 @@ func (tb *tokenBucket) tryConsume(n float64) bool {
 	if tb.tokens > tb.capacity {
 		tb.tokens = tb.capacity
 	}
-
-	if tb.tokens < n {
-		return false
-	}
-	tb.tokens -= n
-	return true
 }
