@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	flushInterval   = 500 * time.Millisecond
-	maxBatchSize    = 100
-	rateLimitPerMin = 200
+	flushInterval    = 500 * time.Millisecond
+	maxBatchSize     = 100
+	earlyFlushThresh = 150
+	rateLimitPerMin  = 200
 )
 
 // BatchResult is delivered to the waiter for a single pending call.
@@ -76,10 +77,10 @@ func (b *Batcher) Add(method string, input map[string]any, prio int) <-chan Batc
 		seq:      b.seq,
 		resultCh: ch,
 	})
-	full := len(b.queue) >= maxBatchSize
+	overflow := len(b.queue) >= earlyFlushThresh
 	b.mu.Unlock()
 
-	if full && b.tokens.hasAtLeast(5) {
+	if overflow {
 		select {
 		case b.flushCh <- struct{}{}:
 		default:
@@ -240,14 +241,6 @@ func (tb *tokenBucket) tryConsume(n float64) bool {
 	}
 	tb.tokens -= n
 	return true
-}
-
-func (tb *tokenBucket) hasAtLeast(n float64) bool {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	tb.refillLocked()
-	return tb.tokens >= n
 }
 
 func (tb *tokenBucket) refillLocked() {
