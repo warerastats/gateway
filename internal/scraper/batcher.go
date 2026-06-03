@@ -16,7 +16,7 @@ import (
 
 const (
 	flushInterval    = 100 * time.Millisecond
-	maxBatchSize     = 100
+	maxBatchSize     = 50
 	earlyFlushThresh = 150
 	rateLimitPerMin  = 200
 )
@@ -77,7 +77,15 @@ func (b *Batcher) Add(method string, input map[string]any, prio int) <-chan Batc
 		seq:      b.seq,
 		resultCh: ch,
 	})
-	overflow := len(b.queue) >= earlyFlushThresh
+	// Filler calls (prio < 0) never count toward the early-flush threshold;
+	// they only top up batches that flush for other reasons.
+	nonFiller := 0
+	for _, p := range b.queue {
+		if p.prio >= 0 {
+			nonFiller++
+		}
+	}
+	overflow := nonFiller >= earlyFlushThresh
 	b.mu.Unlock()
 
 	if overflow {
@@ -117,6 +125,20 @@ func (b *Batcher) flush() {
 		}
 		return b.queue[i].seq < b.queue[j].seq
 	})
+
+	// Filler-only queues never trigger an upstream call; they only top up
+	// batches that already have non-filler work to do.
+	hasNonFiller := false
+	for _, p := range b.queue {
+		if p.prio >= 0 {
+			hasNonFiller = true
+			break
+		}
+	}
+	if !hasNonFiller {
+		b.mu.Unlock()
+		return
+	}
 
 	n := len(b.queue)
 	if n > maxBatchSize {
