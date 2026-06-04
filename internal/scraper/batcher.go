@@ -50,14 +50,22 @@ type Batcher struct {
 	seq   uint64
 
 	flushCh chan struct{}
-	tokens  *tokenBucket
+
+	// One token bucket per API key. Each key gets its own rateLimitPerMin
+	// budget so multiple keys multiply the upstream throughput.
+	buckets []*tokenBucket
+	nextKey int // round-robin cursor into buckets / s.apiKeys
 }
 
 func NewBatcher(s *Scraper) *Batcher {
+	buckets := make([]*tokenBucket, len(s.apiKeys))
+	for i := range buckets {
+		buckets[i] = newTokenBucket(rateLimitPerMin, float64(rateLimitPerMin)/60.0)
+	}
 	b := &Batcher{
 		s:       s,
 		flushCh: make(chan struct{}, 1),
-		tokens:  newTokenBucket(rateLimitPerMin, float64(rateLimitPerMin)/60.0),
+		buckets: buckets,
 	}
 	go b.loop()
 	return b
@@ -113,53 +121,71 @@ func (b *Batcher) loop() {
 
 func (b *Batcher) flush() {
 	b.mu.Lock()
-	if len(b.queue) == 0 {
-		b.mu.Unlock()
-		return
-	}
+	defer b.mu.Unlock()
 
-	// Sort: priority desc, seq asc
-	sort.SliceStable(b.queue, func(i, j int) bool {
-		if b.queue[i].prio != b.queue[j].prio {
-			return b.queue[i].prio > b.queue[j].prio
+	// Dispatch as many batches as we have keys with available tokens, so
+	// multi-key configurations actually get parallel throughput.
+	for {
+		if len(b.queue) == 0 {
+			return
 		}
-		return b.queue[i].seq < b.queue[j].seq
-	})
 
-	// Filler-only queues never trigger an upstream call; they only top up
-	// batches that already have non-filler work to do.
-	hasNonFiller := false
-	for _, p := range b.queue {
-		if p.prio >= 0 {
-			hasNonFiller = true
-			break
+		// Sort: priority desc, seq asc
+		sort.SliceStable(b.queue, func(i, j int) bool {
+			if b.queue[i].prio != b.queue[j].prio {
+				return b.queue[i].prio > b.queue[j].prio
+			}
+			return b.queue[i].seq < b.queue[j].seq
+		})
+
+		// Filler-only queues never trigger an upstream call; they only top up
+		// batches that already have non-filler work to do.
+		hasNonFiller := false
+		for _, p := range b.queue {
+			if p.prio >= 0 {
+				hasNonFiller = true
+				break
+			}
 		}
-	}
-	if !hasNonFiller {
-		b.mu.Unlock()
-		return
-	}
+		if !hasNonFiller {
+			return
+		}
 
-	n := len(b.queue)
-	if n > maxBatchSize {
-		n = maxBatchSize
+		keyIdx := b.pickKey()
+		if keyIdx < 0 {
+			// No key has an upstream slot right now; leave the queue for next tick.
+			return
+		}
+
+		n := len(b.queue)
+		if n > maxBatchSize {
+			n = maxBatchSize
+		}
+
+		batch := make([]*pendingCall, n)
+		copy(batch, b.queue[:n])
+		b.queue = b.queue[n:]
+
+		go b.executePending(batch, b.s.apiKeys[keyIdx])
 	}
-
-	if !b.tokens.tryConsume(1) {
-		// No upstream slot available right now; leave queue intact for next tick.
-		b.mu.Unlock()
-		return
-	}
-
-	batch := make([]*pendingCall, n)
-	copy(batch, b.queue[:n])
-	b.queue = b.queue[n:]
-	b.mu.Unlock()
-
-	go b.executePending(batch)
 }
 
-func (b *Batcher) executePending(pending []*pendingCall) {
+// pickKey returns the index of an API key whose bucket had a free token (now
+// consumed), advancing the round-robin cursor. Returns -1 if every key is
+// currently rate-limited.
+func (b *Batcher) pickKey() int {
+	n := len(b.buckets)
+	for i := 0; i < n; i++ {
+		idx := (b.nextKey + i) % n
+		if b.buckets[idx].tryConsume(1) {
+			b.nextKey = (idx + 1) % n
+			return idx
+		}
+	}
+	return -1
+}
+
+func (b *Batcher) executePending(pending []*pendingCall, apiKey string) {
 	methods := make([]string, 0, len(pending))
 	bodyMap := make(map[string]map[string]any, len(pending))
 	for i, p := range pending {
@@ -181,7 +207,7 @@ func (b *Batcher) executePending(pending []*pendingCall) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Api-Key", b.s.apiKey)
+	req.Header.Set("X-Api-Key", apiKey)
 
 	resp, err := b.s.client.Do(req)
 	if err != nil {
