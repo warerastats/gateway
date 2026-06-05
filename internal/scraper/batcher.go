@@ -15,10 +15,14 @@ import (
 )
 
 const (
-	flushInterval    = 100 * time.Millisecond
-	maxBatchSize     = 50
-	earlyFlushThresh = 150
-	rateLimitPerMin  = 200
+	// flushInterval is how often the batcher re-evaluates the queue.
+	flushInterval = 100 * time.Millisecond
+	// maxWait is the longest a non-filler call waits before its batch flushes.
+	maxWait = 500 * time.Millisecond
+	// flushThresh flushes a batch as soon as this many non-filler calls queue up.
+	flushThresh     = 10
+	maxBatchSize    = 50
+	rateLimitPerMin = 200
 )
 
 // BatchResult is delivered to the waiter for a single pending call.
@@ -39,6 +43,7 @@ type pendingCall struct {
 	input    map[string]any
 	prio     int
 	seq      uint64
+	at       time.Time
 	resultCh chan BatchResult
 }
 
@@ -48,8 +53,6 @@ type Batcher struct {
 	mu    sync.Mutex
 	queue []*pendingCall
 	seq   uint64
-
-	flushCh chan struct{}
 
 	// One token bucket per API key. Each key gets its own rateLimitPerMin
 	// budget so multiple keys multiply the upstream throughput.
@@ -64,7 +67,6 @@ func NewBatcher(s *Scraper) *Batcher {
 	}
 	b := &Batcher{
 		s:       s,
-		flushCh: make(chan struct{}, 1),
 		buckets: buckets,
 	}
 	go b.loop()
@@ -83,25 +85,10 @@ func (b *Batcher) Add(method string, input map[string]any, prio int) <-chan Batc
 		input:    input,
 		prio:     prio,
 		seq:      b.seq,
+		at:       time.Now(),
 		resultCh: ch,
 	})
-	// Filler calls (prio < 0) never count toward the early-flush threshold;
-	// they only top up batches that flush for other reasons.
-	nonFiller := 0
-	for _, p := range b.queue {
-		if p.prio >= 0 {
-			nonFiller++
-		}
-	}
-	overflow := nonFiller >= earlyFlushThresh
 	b.mu.Unlock()
-
-	if overflow {
-		select {
-		case b.flushCh <- struct{}{}:
-		default:
-		}
-	}
 
 	return ch
 }
@@ -109,61 +96,63 @@ func (b *Batcher) Add(method string, input map[string]any, prio int) <-chan Batc
 func (b *Batcher) loop() {
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			b.flush()
-		case <-b.flushCh:
-			b.flush()
+	for range ticker.C {
+		b.flush()
+	}
+}
+
+// ready reports whether the queue should flush now: either flushThresh
+// non-filler calls have accumulated, or the oldest non-filler call has waited
+// at least maxWait. Filler calls (prio < 0) never make the queue ready on
+// their own; they only ride along once real work flushes.
+func (b *Batcher) ready() bool {
+	var oldest time.Time
+	n := 0
+	for _, p := range b.queue {
+		if p.prio < 0 {
+			continue
+		}
+		n++
+		if oldest.IsZero() || p.at.Before(oldest) {
+			oldest = p.at
 		}
 	}
+	if n == 0 {
+		return false
+	}
+	return n >= flushThresh || time.Since(oldest) >= maxWait
 }
 
 func (b *Batcher) flush() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if !b.ready() {
+		return
+	}
+
+	// Sort once (priority desc, seq asc); we only ever pop from the front, so
+	// non-filler calls lead and filler calls trail.
+	sort.SliceStable(b.queue, func(i, j int) bool {
+		if b.queue[i].prio != b.queue[j].prio {
+			return b.queue[i].prio > b.queue[j].prio
+		}
+		return b.queue[i].seq < b.queue[j].seq
+	})
+
 	// Dispatch as many batches as we have keys with available tokens, so
-	// multi-key configurations actually get parallel throughput.
-	for {
-		if len(b.queue) == 0 {
-			return
-		}
-
-		// Sort: priority desc, seq asc
-		sort.SliceStable(b.queue, func(i, j int) bool {
-			if b.queue[i].prio != b.queue[j].prio {
-				return b.queue[i].prio > b.queue[j].prio
-			}
-			return b.queue[i].seq < b.queue[j].seq
-		})
-
-		// Filler-only queues never trigger an upstream call; they only top up
-		// batches that already have non-filler work to do.
-		hasNonFiller := false
-		for _, p := range b.queue {
-			if p.prio >= 0 {
-				hasNonFiller = true
-				break
-			}
-		}
-		if !hasNonFiller {
-			return
-		}
-
+	// multi-key configurations actually get parallel throughput. Stop once the
+	// front is filler-only: those never trigger an upstream call alone.
+	for len(b.queue) > 0 && b.queue[0].prio >= 0 {
 		keyIdx := b.pickKey()
 		if keyIdx < 0 {
-			// No key has an upstream slot right now; leave the queue for next tick.
+			// No key has an upstream slot right now; leave the rest for next tick.
 			return
 		}
 
-		n := len(b.queue)
-		if n > maxBatchSize {
-			n = maxBatchSize
-		}
-
+		n := min(len(b.queue), maxBatchSize)
 		batch := make([]*pendingCall, n)
-		copy(batch, b.queue[:n])
+		copy(batch, b.queue)
 		b.queue = b.queue[n:]
 
 		go b.executePending(batch, b.s.apiKeys[keyIdx])
