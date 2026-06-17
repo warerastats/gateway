@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 type Scraper struct {
@@ -37,7 +38,7 @@ func NewScraper() *Scraper {
 	slog.Info("loaded warera api keys", "count", len(keys))
 
 	s := &Scraper{
-		client:  http.Client{},
+		client:  http.Client{Timeout: 30 * time.Second},
 		apiKeys: keys,
 		baseURL: "https://api2.warera.io/trpc/",
 	}
